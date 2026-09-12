@@ -2195,13 +2195,70 @@ var K = {
   notifiedMeals:'autokcal.notifiedMeals'   // SUPABASE TODO -> table: reminder_sends (date, meal) -- stops re-notifying same meal twice
 };
 
+/* ---------------------------------------------------------------------------
+   1.5 CLOUD SYNC
+   localStorage stays the thing every Store method actually reads and writes
+   -- nothing about that changes, which is what keeps this a small addition
+   instead of a rewrite of every screen. This layer just keeps it in sync
+   with the user_data table: CLOUD_UID marks whose data local storage
+   currently mirrors, pullFromCloud() brings a signed-in user's real data
+   down (wiping local first if it belonged to a different account, so two
+   people signing in on the same browser can never see each other's data),
+   and pushToCloud() sends a change up in the background right after it's
+   written locally. Only the keys listed here are personal data worth
+   syncing; caches like nutrition/image lookups stay local-only on purpose.
+   ------------------------------------------------------------------------ */
+var CLOUD_UID = null;
+var CLOUD_KEYS = {
+  profile: 'profile', usuals: 'usuals', logs: 'logs', interactions: 'interactions',
+  customFoods: 'customFoods', orders: 'orders', bundles: 'bundles', settings: 'settings',
+  autopilotSkips: 'autopilotSkips', notifiedMeals: 'notifiedMeals'
+};
+var LOCAL_TO_CLOUD_KEY = {};
+Object.keys(CLOUD_KEYS).forEach(function (shortKey) { LOCAL_TO_CLOUD_KEY[K[shortKey]] = shortKey; });
+var CLOUD_UID_MARKER = 'autokcal.cloudUid';
+
+function clearSyncedLocalData() {
+  Object.keys(CLOUD_KEYS).forEach(function (shortKey) { Storage.remove(K[shortKey]); });
+}
+
+function pushToCloud(shortKey, val) {
+  if (!CLOUD_UID) return;
+  sb.from('user_data').upsert(
+    { user_id: CLOUD_UID, key: shortKey, value: val, updated_at: new Date().toISOString() },
+    { onConflict: 'user_id,key' }
+  ).then(function (res) {
+    if (res.error) console.warn('cloud sync failed for ' + shortKey, res.error);
+  });
+}
+
+function pullFromCloud(uid) {
+  var lastUid = Storage.get(CLOUD_UID_MARKER);
+  if (lastUid !== uid) clearSyncedLocalData();   // different account on this browser -- start clean
+  return sb.from('user_data').select('key,value').eq('user_id', uid).then(function (res) {
+    if (!res.error && res.data) {
+      res.data.forEach(function (row) {
+        var localKey = K[row.key];
+        if (localKey) Storage.set(localKey, JSON.stringify(row.value));
+      });
+    }
+    Storage.set(CLOUD_UID_MARKER, uid);
+    CLOUD_UID = uid;
+  });
+}
+
 var Store = {
   _read: function (key, fallback) {
     var raw = Storage.get(key);
     if (!raw) return fallback;
     try { return JSON.parse(raw); } catch (e) { return fallback; }
   },
-  _write: function (key, val) { Storage.set(key, JSON.stringify(val)); return val; },
+  _write: function (key, val) {
+    Storage.set(key, JSON.stringify(val));
+    var cloudKey = LOCAL_TO_CLOUD_KEY[key];
+    if (cloudKey) pushToCloud(cloudKey, val);
+    return val;
+  },
 
   /* auth ------------------------------------------------------------------ */
   // Real sign-in/out now goes through Supabase Auth (email OTP; Google next).
@@ -2211,6 +2268,9 @@ var Store = {
   signIn: function (email, provider) { return this._write(K.session, { email: email, signedInAt: Date.now(), provider: provider || 'email-otp' }); },
   signOut: function () {
     Storage.remove(K.session);
+    clearSyncedLocalData();
+    Storage.remove(CLOUD_UID_MARKER);
+    CLOUD_UID = null;
     if (window.sb && sb.auth) sb.auth.signOut();
   },
 
@@ -4657,16 +4717,17 @@ $('#btn-google').addEventListener('click', function () {
   });
 });
 
-function afterSignedIn(email) {
+function afterSignedIn(email, uid) {
   // A returning, already-onboarded person skips straight back into the app;
-  // anyone else (brand new, or partway through) goes into onboarding.
-  // NOTE: the profile check here is still reading this *browser's* local
-  // storage, not the account's data in Supabase -- that swap is the next
-  // step, so today, signing in on a different device starts fresh even for
-  // an existing account. Expected for now, not a bug.
-  var existing = Store.getProfile();
-  if (existing && existing.onboarded) { openApp('home'); return; }
-  startOnboarding(email, existing ? existing.obStep : 0);
+  // anyone else (brand new, or partway through) goes into onboarding. The
+  // cloud pull runs first so that check is based on the account's real
+  // data, not just whatever happens to be sitting in this browser.
+  function proceed() {
+    var existing = Store.getProfile();
+    if (existing && existing.onboarded) { openApp('home'); return; }
+    startOnboarding(email, existing ? existing.obStep : 0);
+  }
+  if (uid) pullFromCloud(uid).then(proceed); else proceed();
 }
 
 $('#btn-send-otp').addEventListener('click', function () {
@@ -4697,7 +4758,8 @@ $('#btn-verify-otp').addEventListener('click', function () {
     var email = OTP_EMAIL;
     Store.signIn(email, 'email-otp');
     track('signup_completed', { email: email, method: 'email_otp' });
-    afterSignedIn(email);
+    var uid = res.data && res.data.session && res.data.session.user && res.data.session.user.id;
+    afterSignedIn(email, uid);
   });
 });
 
@@ -8235,6 +8297,12 @@ function bindTab(v) {
    17. DEMO PROFILE
    ------------------------------------------------------------------------ */
 function seedDemo() {
+  // Belt-and-suspenders: make sure demo data can never land in a real
+  // account's cloud data, even if someone taps this while still signed in
+  // for real (e.g. navigated back to this screen without logging out first).
+  CLOUD_UID = null;
+  Storage.remove(CLOUD_UID_MARKER);
+  if (window.sb && sb.auth) sb.auth.signOut();
   Store.wipe();
   Store.signIn('arjun.mehta@gmail.com', 'demo');
   var profile = {
@@ -8345,14 +8413,17 @@ function seedDemo() {
   // redirect, or this is a browser that already had one -- is the actual
   // source of truth for "is someone signed in," so it's checked before
   // deciding what to show. This mirrors it into the local Store session
-  // that the rest of the app already reads.
+  // that the rest of the app already reads, and pulls that account's real
+  // data down from the cloud before finishBoot() looks at it.
   sb.auth.getSession().then(function (res) {
     var sbSession = res.data && res.data.session;
     if (sbSession && sbSession.user && sbSession.user.email) {
       var provider = (sbSession.user.app_metadata && sbSession.user.app_metadata.provider) || 'google';
       Store.signIn(sbSession.user.email, provider);
+      pullFromCloud(sbSession.user.id).then(finishBoot);
+    } else {
+      finishBoot();
     }
-    finishBoot();
   });
 })();
 
