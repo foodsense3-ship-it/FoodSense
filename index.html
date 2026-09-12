@@ -2067,6 +2067,11 @@ html[data-theme="dark"] [data-tip]::before{border-top-color:#1E2C50}
       </div>
 
       <div class="fs-bottom">
+        <button class="gbtn" id="btn-google">
+          <svg class="gmark" viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M23 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.2a5.3 5.3 0 0 1-2.3 3.5v2.9h3.7c2.2-2 3.4-5 3.4-8.6z"/><path fill="#34A853" d="M12 24c3.1 0 5.7-1 7.6-2.8l-3.7-2.9c-1 .7-2.3 1.1-3.9 1.1-3 0-5.5-2-6.4-4.7H1.8v3C3.7 21.4 7.5 24 12 24z"/><path fill="#FBBC05" d="M5.6 14.7a7.2 7.2 0 0 1 0-4.6v-3H1.8a12 12 0 0 0 0 10.6l3.8-3z"/><path fill="#EA4335" d="M12 4.8c1.7 0 3.2.6 4.4 1.7l3.3-3.3C17.7 1.2 15.1 0 12 0 7.5 0 3.7 2.6 1.8 6.4l3.8 3C6.5 6.7 9 4.8 12 4.8z"/></svg>
+          Continue with Google
+        </button>
+        <p class="tiny" style="text-align:center;margin:12px 0">or</p>
         <div id="otp-email-step">
           <div class="field">
             <label class="label" for="otp-email">Email address</label>
@@ -2084,7 +2089,7 @@ html[data-theme="dark"] [data-tip]::before{border-top-color:#1E2C50}
           <button class="btn btn-quiet" id="btn-otp-back" style="margin-top:2px">Use a different email</button>
         </div>
         <button class="btn fs-demo" id="btn-demo" style="margin-top:12px">Use demo profile</button>
-        <p class="auth-note">We&rsquo;ll email you a 6-digit code &mdash; no password needed. Google sign-in is coming soon.</p>
+        <p class="auth-note">We&rsquo;ll email you a 6-digit code &mdash; no password needed.</p>
       </div>
     </div>
   </section>
@@ -4638,6 +4643,19 @@ function go(screen) {
    and never touches the backend; Google sign-in is a later addition)
    ------------------------------------------------------------------------ */
 var OTP_EMAIL = null;
+
+$('#btn-google').addEventListener('click', function () {
+  track('signup_started', { method: 'google' });
+  // Supabase takes it from here: this navigates the browser to Google's
+  // account picker, and Google sends the person back to this exact page
+  // once they choose an account. finishBoot() (in the BOOT section) is what
+  // notices the resulting session and signs them in -- there's no "then"
+  // to chain here because the browser leaves this page entirely.
+  sb.auth.signInWithOAuth({
+    provider: 'google',
+    options: { redirectTo: window.location.origin + window.location.pathname }
+  });
+});
 
 function afterSignedIn(email) {
   // A returning, already-onboarded person skips straight back into the app;
@@ -8323,12 +8341,28 @@ function seedDemo() {
     strip.innerHTML = shots.map(function (x) { return photoSlot(x[0], x[1], 'dish', 'authshot', x[2]); }).join('');
     hydrateImages(strip);
   }
+  // A real Supabase session -- whether we just landed back from Google's
+  // redirect, or this is a browser that already had one -- is the actual
+  // source of truth for "is someone signed in," so it's checked before
+  // deciding what to show. This mirrors it into the local Store session
+  // that the rest of the app already reads.
+  sb.auth.getSession().then(function (res) {
+    var sbSession = res.data && res.data.session;
+    if (sbSession && sbSession.user && sbSession.user.email) {
+      var provider = (sbSession.user.app_metadata && sbSession.user.app_metadata.provider) || 'google';
+      Store.signIn(sbSession.user.email, provider);
+    }
+    finishBoot();
+  });
+})();
+
+function finishBoot() {
   var session = Store.getSession(), profile = Store.getProfile();
   if (!session) { go('auth'); return; }
   if (!profile || !profile.onboarded) { startOnboarding(session.email, profile ? profile.obStep : 0); return; }
   openApp('home');
   checkWristReminder();
-})();
+}
 </script>
 </body>
 </html>
